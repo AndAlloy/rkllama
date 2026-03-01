@@ -600,8 +600,8 @@ def main():
         if len(sys.argv) > 2:
             PORT = sys.argv[2]
 
-        server_script = os.path.join(rkllama.config.get_path(), 'server.sh')
-        os.system(f"bash {server_script} {'--no-conda' if use_no_conda else ''} --port={PORT}")
+        cmd = [sys.executable, "-m", "rkllama.server.server", f"--port={PORT}"]
+        subprocess.run(cmd)
 
     elif command == "update":
         update()

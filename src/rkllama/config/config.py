@@ -122,14 +122,14 @@ class RKLLAMAConfig:
         return value
         
     def _determine_app_root(self) -> Path:
-        """Finds the application root directory"""
+        """Finds the application root directory (the rkllama package directory)"""
         if getattr(sys, 'frozen', False):
             # Frozen application (PyInstaller)
             app_path = Path(sys.executable).parent
         else:
-            # Regular Python script
-            app_path = Path(__file__).parent
-            
+            # Regular Python script — go up from config/config.py to the package root
+            app_path = Path(__file__).parent.parent
+
         return app_path
     
     def _load_defaults(self):
@@ -149,10 +149,14 @@ class RKLLAMAConfig:
             config = configparser.ConfigParser()
             for section, values in default_config.items():
                 config[section] = {k: str(v) for k, v in values.items()}
-                
-            with open(default_ini_path, "w") as f:
-                config.write(f)
-        
+
+            try:
+                with open(default_ini_path, "w") as f:
+                    config.write(f)
+            except OSError:
+                # Install directory is read-only (e.g. system-wide install) — skip writing
+                pass
+
         self.config.update(default_config)
     
     def _load_config_file(self, config_path: Union[str, Path]):
@@ -533,11 +537,14 @@ class RKLLAMAConfig:
             lines.append("")
         
         # Write to file
-        with open(config_env_path, "w") as f:
-            f.write("\n".join(lines))
-            
-        # Make the file executable
-        os.chmod(config_env_path, 0o755)
+        try:
+            with open(config_env_path, "w") as f:
+                f.write("\n".join(lines))
+            # Make the file executable
+            os.chmod(config_env_path, 0o755)
+        except OSError:
+            # Install directory is read-only (e.g. system-wide install) — skip writing
+            pass
         
         logger.debug(f"Generated shell configuration: {config_env_path}")
         

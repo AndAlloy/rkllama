@@ -247,12 +247,12 @@ def create_rkllama_schema() -> ConfigSchema:
     
     # Paths section
     paths = schema.add_section("paths", description="Path configuration")
-    paths.path("models", "models", "Path to model files")
-    paths.path("logs", "logs", "Path to log files")
-    paths.path("data", "data", "Path to data files")
-    paths.path("src", "src", "Path to source files")
-    paths.path("lib", "lib", "Path to library files")
-    paths.path("temp", "temp", "Path to temporary files")
+    paths.path("models", "~/.local/share/rkllama/models", "Path to model files")
+    paths.path("logs",   "~/.local/share/rkllama/logs",   "Path to log files")
+    paths.path("data",   "~/.local/share/rkllama/data",   "Path to data files")
+    paths.path("src",    "src",                            "Path to source files")
+    paths.path("lib",    "lib",                            "Path to library files")
+    paths.path("temp",   "~/.local/share/rkllama/temp",   "Path to temporary files")
     
     # Model section
     model = schema.add_section("model", description="Model configuration")
