@@ -27,9 +27,13 @@ Install the package (a virtual environment is recommended but not required):
 python3 -m venv .venv
 source .venv/bin/activate
 
-# Install
-pip install .
+# Install — --find-links tells pip where the bundled rknn wheel is
+pip install --find-links=src/rkllama/lib .
 ```
+
+> The `--find-links` flag is required because `rknn-toolkit-lite2` is a platform-specific wheel
+> bundled inside the repo rather than published on PyPI. pip picks the correct wheel automatically
+> based on your Python version (3.9 – 3.12).
 
 After installation, two commands become available system-wide:
 
