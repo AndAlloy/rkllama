@@ -1,6 +1,7 @@
 # Import libs
 import sys, os, subprocess, resource, argparse, shutil, time, requests, json, datetime, logging
 import re
+import uuid
 from dotenv import load_dotenv
 from huggingface_hub import hf_hub_url, HfFileSystem
 from flask import Flask, request, jsonify, Response, stream_with_context, send_file
@@ -1259,6 +1260,156 @@ def chat_ollama():
             if DEBUG_MODE:
                 logger.debug("Releasing lock in chat_ollama")
             variables.verrou.release()
+
+
+@app.route('/v1/responses', methods=['POST'])
+def responses_openai():
+    """OpenAI Responses API — translates to /v1/chat/completions internally."""
+    try:
+        data = request.get_json(force=True)
+        model_name = data.get('model', '')
+        stream = data.get('stream', False)
+
+        # Convert Responses API 'input' to chat messages
+        raw_input = data.get('input', [])
+        if isinstance(raw_input, str):
+            messages = [{"role": "user", "content": raw_input}]
+        else:
+            messages = []
+            for item in raw_input:
+                if not isinstance(item, dict):
+                    continue
+                role = item.get('role', 'user')
+                content = item.get('content', '')
+                if isinstance(content, list):
+                    content = ''.join(
+                        p.get('text', '') for p in content
+                        if isinstance(p, dict) and p.get('type') == 'text'
+                    )
+                messages.append({'role': role, 'content': content})
+
+        # 'instructions' maps to a system message
+        if data.get('instructions'):
+            messages = [{"role": "system", "content": data['instructions']}] + messages
+
+        # Build the equivalent chat completions request
+        chat_req = {"model": model_name, "messages": messages, "stream": stream}
+        if data.get('max_output_tokens') is not None:
+            chat_req['max_tokens'] = data['max_output_tokens']
+        if data.get('temperature') is not None:
+            chat_req['temperature'] = data['temperature']
+        if data.get('top_p') is not None:
+            chat_req['top_p'] = data['top_p']
+        if data.get('tools'):
+            chat_req['tools'] = data['tools']
+
+        port = rkllama.config.get("server", "port", 8080)
+        base_url = f"http://localhost:{port}"
+
+        if stream:
+            response_id = f"resp_{uuid.uuid4().hex[:24]}"
+            msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+            created_at = int(time.time())
+
+            def generate():
+                yield (
+                    f"event: response.created\n"
+                    f"data: {json.dumps({'type': 'response.created', 'response': {'id': response_id, 'object': 'response', 'created_at': created_at, 'status': 'in_progress', 'model': model_name, 'output': []}})}\n\n"
+                )
+                yield (
+                    f"event: response.output_item.added\n"
+                    f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': 0, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'in_progress', 'content': []}})}\n\n"
+                )
+                yield (
+                    f"event: response.content_part.added\n"
+                    f"data: {json.dumps({'type': 'response.content_part.added', 'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
+                )
+
+                complete_text = ""
+                input_tokens = 0
+                output_tokens = 0
+
+                with requests.post(f"{base_url}/v1/chat/completions", json=chat_req, stream=True, timeout=300) as resp:
+                    for line in resp.iter_lines():
+                        if not line:
+                            continue
+                        line_str = line.decode('utf-8') if isinstance(line, bytes) else line
+                        if not line_str.startswith('data: '):
+                            continue
+                        data_str = line_str[6:]
+                        if data_str == '[DONE]':
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            choices = chunk.get('choices', [])
+                            if choices:
+                                token = choices[0].get('delta', {}).get('content', '') or ''
+                                if token:
+                                    complete_text += token
+                                    output_tokens += 1
+                                    yield (
+                                        f"event: response.output_text.delta\n"
+                                        f"data: {json.dumps({'type': 'response.output_text.delta', 'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'delta': token})}\n\n"
+                                    )
+                            usage = chunk.get('usage') or {}
+                            if usage.get('prompt_tokens'):
+                                input_tokens = usage['prompt_tokens']
+                            if usage.get('completion_tokens'):
+                                output_tokens = usage['completion_tokens']
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+
+                yield (
+                    f"event: response.output_text.done\n"
+                    f"data: {json.dumps({'type': 'response.output_text.done', 'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'text': complete_text})}\n\n"
+                )
+                yield (
+                    f"event: response.output_item.done\n"
+                    f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': 0, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'completed', 'content': [{'type': 'output_text', 'text': complete_text}]}})}\n\n"
+                )
+                yield (
+                    f"event: response.completed\n"
+                    f"data: {json.dumps({'type': 'response.completed', 'response': {'id': response_id, 'object': 'response', 'created_at': created_at, 'status': 'completed', 'model': model_name, 'output': [{'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'completed', 'content': [{'type': 'output_text', 'text': complete_text}]}], 'usage': {'input_tokens': input_tokens, 'output_tokens': output_tokens, 'total_tokens': input_tokens + output_tokens, 'output_tokens_details': {'reasoning_tokens': 0}}}})}\n\n"
+                )
+
+            return Response(stream_with_context(generate()), mimetype='text/event-stream')
+
+        else:
+            resp = requests.post(f"{base_url}/v1/chat/completions", json=chat_req, timeout=300)
+            if not resp.ok:
+                return jsonify({"error": resp.text}), resp.status_code
+
+            chat_data = resp.json()
+            text_content = ''
+            choices = chat_data.get('choices', [])
+            if choices:
+                text_content = choices[0].get('message', {}).get('content', '') or ''
+            usage = chat_data.get('usage') or {}
+
+            return jsonify({
+                "id": f"resp_{uuid.uuid4().hex[:24]}",
+                "object": "response",
+                "created_at": int(time.time()),
+                "status": "completed",
+                "model": chat_data.get('model', model_name),
+                "output": [{
+                    "type": "message",
+                    "id": f"msg_{uuid.uuid4().hex[:24]}",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": text_content}]
+                }],
+                "usage": {
+                    "input_tokens": usage.get('prompt_tokens', 0),
+                    "output_tokens": usage.get('completion_tokens', 0),
+                    "total_tokens": usage.get('total_tokens', 0),
+                    "output_tokens_details": {"reasoning_tokens": 0}
+                }
+            })
+
+    except Exception as e:
+        logger.exception("Error in responses_openai")
+        return jsonify({"error": str(e)}), 500
 
 
 # Only include debug endpoint if in debug mode
