@@ -1275,6 +1275,7 @@ def responses_openai():
         model_name = data.get('model', '')
         stream = data.get('stream', False)
         previous_response_id = data.get('previous_response_id')
+        logger.debug(f"[responses] previous_response_id={previous_response_id}, history_size={len(_responses_history)}")
 
         # Convert Responses API 'input' to chat messages
         raw_input = data.get('input', [])
