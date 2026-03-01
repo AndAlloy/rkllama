@@ -4,6 +4,7 @@ import datetime
 import logging
 import os
 import re  # Add import for regex used in JSON extraction
+from queue import Empty as QueueEmpty
 import rkllama.api.variables as variables
 from transformers import AutoTokenizer
 from flask import jsonify, Response, stream_with_context
@@ -272,10 +273,14 @@ class ChatEndpointHandler(EndpointHandler):
             response_tokens = [] # All tokens from response
             thinking_response_tokens = [] # Thinking tokens from response
             final_response_tokens = [] # Final answer tokens from response
-            
+
 
             while not thread_finished or not final_sent:
-                token = result_q.get(timeout=300)  # Block until receive any token
+                try:
+                    token = result_q.get(timeout=300)  # Block until receive any token
+                except QueueEmpty:
+                    logger.warning(f"Inference queue empty for model {model_name}, ending stream")
+                    token = finished_inference_token
                 if token == finished_inference_token:
                     thread_finished = True
             
@@ -587,9 +592,13 @@ class GenerateEndpointHandler(EndpointHandler):
             final_sent = False
 
             thread_finished = False
- 
+
             while not thread_finished or not final_sent:
-                token = result_q.get(timeout=300)  # Block until receive any token
+                try:
+                    token = result_q.get(timeout=300)  # Block until receive any token
+                except QueueEmpty:
+                    logger.warning(f"Inference queue empty for model {model_name}, ending stream")
+                    token = finished_inference_token
                 if token == finished_inference_token:
                     thread_finished = True
             

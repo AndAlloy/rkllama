@@ -1262,6 +1262,11 @@ def chat_ollama():
             variables.verrou.release()
 
 
+# Conversation history for /v1/responses multi-turn support
+_responses_history: dict = {}
+_RESPONSES_HISTORY_MAX = 100
+
+
 @app.route('/v1/responses', methods=['POST'])
 def responses_openai():
     """OpenAI Responses API — translates to /v1/chat/completions internally."""
@@ -1269,13 +1274,14 @@ def responses_openai():
         data = request.get_json(force=True)
         model_name = data.get('model', '')
         stream = data.get('stream', False)
+        previous_response_id = data.get('previous_response_id')
 
         # Convert Responses API 'input' to chat messages
         raw_input = data.get('input', [])
         if isinstance(raw_input, str):
-            messages = [{"role": "user", "content": raw_input}]
+            current_messages = [{"role": "user", "content": raw_input}]
         else:
-            messages = []
+            current_messages = []
             for item in raw_input:
                 if not isinstance(item, dict):
                     continue
@@ -1286,11 +1292,18 @@ def responses_openai():
                         p.get('text', '') for p in content
                         if isinstance(p, dict) and p.get('type') == 'text'
                     )
-                messages.append({'role': role, 'content': content})
+                current_messages.append({'role': role, 'content': content})
 
-        # 'instructions' maps to a system message
+        # Reconstruct full conversation history if previous_response_id provided
+        if previous_response_id and previous_response_id in _responses_history:
+            messages = _responses_history[previous_response_id] + current_messages
+        else:
+            messages = current_messages
+
+        # 'instructions' maps to a system message (prepend only if no system msg yet)
         if data.get('instructions'):
-            messages = [{"role": "system", "content": data['instructions']}] + messages
+            if not messages or messages[0].get('role') != 'system':
+                messages = [{"role": "system", "content": data['instructions']}] + messages
 
         # Build the equivalent chat completions request
         chat_req = {"model": model_name, "messages": messages, "stream": stream}
@@ -1329,36 +1342,47 @@ def responses_openai():
                 input_tokens = 0
                 output_tokens = 0
 
-                with requests.post(f"{base_url}/v1/chat/completions", json=chat_req, stream=True, timeout=300) as resp:
-                    for line in resp.iter_lines():
-                        if not line:
-                            continue
-                        line_str = line.decode('utf-8') if isinstance(line, bytes) else line
-                        if not line_str.startswith('data: '):
-                            continue
-                        data_str = line_str[6:]
-                        if data_str == '[DONE]':
-                            break
-                        try:
-                            chunk = json.loads(data_str)
-                            choices = chunk.get('choices', [])
-                            if choices:
-                                token = choices[0].get('delta', {}).get('content', '') or ''
-                                if token:
-                                    complete_text += token
-                                    output_tokens += 1
-                                    yield (
-                                        f"event: response.output_text.delta\n"
-                                        f"data: {json.dumps({'type': 'response.output_text.delta', 'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'delta': token})}\n\n"
-                                    )
-                            usage = chunk.get('usage') or {}
-                            if usage.get('prompt_tokens'):
-                                input_tokens = usage['prompt_tokens']
-                            if usage.get('completion_tokens'):
-                                output_tokens = usage['completion_tokens']
-                        except (json.JSONDecodeError, KeyError):
-                            pass
+                try:
+                    with requests.post(f"{base_url}/v1/chat/completions", json=chat_req, stream=True, timeout=300) as resp:
+                        for line in resp.iter_lines():
+                            if not line:
+                                continue
+                            line_str = line.decode('utf-8') if isinstance(line, bytes) else line
+                            if not line_str.startswith('data: '):
+                                continue
+                            data_str = line_str[6:]
+                            if data_str == '[DONE]':
+                                break
+                            try:
+                                chunk = json.loads(data_str)
+                                choices = chunk.get('choices', [])
+                                if choices:
+                                    token = choices[0].get('delta', {}).get('content', '') or ''
+                                    if token:
+                                        complete_text += token
+                                        output_tokens += 1
+                                        yield (
+                                            f"event: response.output_text.delta\n"
+                                            f"data: {json.dumps({'type': 'response.output_text.delta', 'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'delta': token})}\n\n"
+                                        )
+                                usage = chunk.get('usage') or {}
+                                if usage.get('prompt_tokens'):
+                                    input_tokens = usage['prompt_tokens']
+                                if usage.get('completion_tokens'):
+                                    output_tokens = usage['completion_tokens']
+                            except (json.JSONDecodeError, KeyError):
+                                pass
+                except Exception:
+                    logger.exception("Error streaming from /v1/chat/completions in responses_openai")
 
+                # Store history so next turn can use previous_response_id
+                _responses_history[response_id] = messages + [{"role": "assistant", "content": complete_text}]
+                # Evict oldest entries to cap memory usage
+                if len(_responses_history) > _RESPONSES_HISTORY_MAX:
+                    oldest = next(iter(_responses_history))
+                    del _responses_history[oldest]
+
+                # Always send terminal events regardless of errors above
                 yield (
                     f"event: response.output_text.done\n"
                     f"data: {json.dumps({'type': 'response.output_text.done', 'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'text': complete_text})}\n\n"
@@ -1386,15 +1410,24 @@ def responses_openai():
                 text_content = choices[0].get('message', {}).get('content', '') or ''
             usage = chat_data.get('usage') or {}
 
+            response_id = f"resp_{uuid.uuid4().hex[:24]}"
+            msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+            # Store history for multi-turn
+            _responses_history[response_id] = messages + [{"role": "assistant", "content": text_content}]
+            if len(_responses_history) > _RESPONSES_HISTORY_MAX:
+                oldest = next(iter(_responses_history))
+                del _responses_history[oldest]
+
             return jsonify({
-                "id": f"resp_{uuid.uuid4().hex[:24]}",
+                "id": response_id,
                 "object": "response",
                 "created_at": int(time.time()),
                 "status": "completed",
                 "model": chat_data.get('model', model_name),
                 "output": [{
                     "type": "message",
-                    "id": f"msg_{uuid.uuid4().hex[:24]}",
+                    "id": msg_id,
                     "role": "assistant",
                     "status": "completed",
                     "content": [{"type": "output_text", "text": text_content}]
