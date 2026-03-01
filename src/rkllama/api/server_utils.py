@@ -27,6 +27,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("rkllama.server_utils")
 
+# Cache loaded tokenizers so they're only loaded once per model per process
+_tokenizer_cache: dict = {}
+
 
 class RequestWrapper:
     """A class that mimics Flask's request object for custom request handling"""
@@ -61,28 +64,30 @@ class EndpointHandler:
     def get_tokenizer(model_name):
         """Get the tokenizer for the model. First try to get from local filesystem and then from HF"""
 
+        if model_name in _tokenizer_cache:
+            return _tokenizer_cache[model_name]
+
         # Construct the path for the local tokenizer
-        local_tokenizer_path = os.path.join(rkllama.config.get_path("models"),model_name, "tokenizer")
-        
+        local_tokenizer_path = os.path.join(rkllama.config.get_path("models"), model_name, "tokenizer")
+
         if not os.path.isdir(local_tokenizer_path):
             logger.debug("Local Tokenizer doesn't exists!")
 
             # Get model specific tokenizer from Huggin Face specified in Modelfile
             model_in_hf = get_property_modelfile(model_name, "HUGGINGFACE_PATH", rkllama.config.get_path("models")).replace('"', '').replace("'", "")
             logger.info(f"Download the tokenizer only one time from Hugging face repo: {model_in_hf}")
-            
+
             # Get the tokenizer configured for the model
             tokenizer = AutoTokenizer.from_pretrained(model_in_hf, trust_remote_code=True)
 
             # Save to the disk the local tokenizer for future use
             tokenizer.save_pretrained(local_tokenizer_path)
 
-        else:     
+        else:
             logger.debug("Local Tokenizer found! Using it...")
-            # Get the local tokenizer for the model
-            tokenizer = AutoTokenizer.from_pretrained(local_tokenizer_path)    
+            tokenizer = AutoTokenizer.from_pretrained(local_tokenizer_path)
 
-        # Return the tokenizer
+        _tokenizer_cache[model_name] = tokenizer
         return tokenizer
 
 
@@ -272,7 +277,8 @@ class ChatEndpointHandler(EndpointHandler):
             thinking = enable_thinking
             response_tokens = [] # All tokens from response
             thinking_response_tokens = [] # Thinking tokens from response
-            final_response_tokens = [] # Final answer tokens from response
+            final_response_tokens = [] # Final answer tokens from response (kept for count/flush)
+            final_response_text = ""  # Running join of final_response_tokens — avoids O(n) join at end
 
 
             while not thread_finished or not final_sent:
@@ -303,8 +309,9 @@ class ChatEndpointHandler(EndpointHandler):
                     complete_text += token
                     response_tokens.append(token)
 
-                    if not thinking and token != "</think>": 
+                    if not thinking and token != "</think>":
                         final_response_tokens.append(token)
+                        final_response_text += token
                     
                     if not tool_calls:
                         if len(final_response_tokens) > max_token_to_wait_for_tool_call or not tools:
@@ -315,9 +322,7 @@ class ChatEndpointHandler(EndpointHandler):
                                 pass
                         elif len(final_response_tokens) == max_token_to_wait_for_tool_call:
                             if variables.global_status != 1:
-                                
                                 for temp_token in response_tokens:
-                                    time.sleep(0.1) # Simulate delay to stream previos tokens
                                     chunk = cls.format_streaming_chunk(model_name=model_name, token=temp_token)
                                     yield f"{json.dumps(chunk)}\n"
                             else:
@@ -335,7 +340,7 @@ class ChatEndpointHandler(EndpointHandler):
 
                     # Final check for tool calls in the complete response
                     if tools:
-                        json_tool_calls = get_tool_calls("".join(final_response_tokens))
+                        json_tool_calls = get_tool_calls(final_response_text)
                         
                         # Last check for non standard <tool_call> token and tools calls only when finished before the wait token time
                         if len(final_response_tokens) < max_token_to_wait_for_tool_call:
@@ -346,11 +351,10 @@ class ChatEndpointHandler(EndpointHandler):
                     if tools and tool_calls:
                         chunk_tool_call = cls.format_streaming_chunk(model_name=model_name, token=json_tool_calls, tool_calls=tool_calls)
                         yield f"{json.dumps(chunk_tool_call)}\n"
-                    elif len(final_response_tokens)  < max_token_to_wait_for_tool_call: 
+                    elif len(final_response_tokens) < max_token_to_wait_for_tool_call:
                         for temp_token in response_tokens:
-                              time.sleep(0.1) # Simulate delay to stream previos tokens
-                              chunk = cls.format_streaming_chunk(model_name=model_name, token=temp_token,tool_calls=tool_calls)
-                              yield f"{json.dumps(chunk)}\n"
+                            chunk = cls.format_streaming_chunk(model_name=model_name, token=temp_token, tool_calls=tool_calls)
+                            yield f"{json.dumps(chunk)}\n"
 
                     metrics = cls.calculate_durations(start_time, prompt_eval_time)
                     metrics["prompt_tokens"] = prompt_token_count

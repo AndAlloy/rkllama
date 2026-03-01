@@ -1,10 +1,11 @@
 import ctypes, sys
+from collections import deque
 import numpy as np
 from .classes import *
 from .variables import *
 
 global_status = -1
-global_text = []
+global_text = deque()
 split_byte_data = bytes(b"")
 last_embeddings = []
 

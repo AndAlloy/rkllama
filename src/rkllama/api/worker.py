@@ -201,19 +201,13 @@ def run_rkllm_worker(name, task_queue: Queue, result_queue: Queue, model_path, m
                 # Looping until execution of the thread
                 thread_finished = False
                 while not thread_finished:
-                    tokens_processed = False
                     while len(global_text) > 0:
-                        token = global_text.pop(0)
+                        token = global_text.popleft()
                         result_queue.put(token)
-                        tokens_processed = True
 
                     # Update status of the thread
                     thread_model.join(timeout=0.001)
                     thread_finished = not thread_model.is_alive()
-                    
-                    # Only sleep if no tokens were processed and thread is still alive
-                    if not tokens_processed and not thread_finished:
-                        time.sleep(0.001)
 
                 # Clear the cache after inference
                 model_rkllm.clear_cache()
