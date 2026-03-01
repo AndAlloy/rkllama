@@ -1291,7 +1291,7 @@ def responses_openai():
                 if isinstance(content, list):
                     content = ''.join(
                         p.get('text', '') for p in content
-                        if isinstance(p, dict) and p.get('type') == 'text'
+                        if isinstance(p, dict) and p.get('type') in ('text', 'input_text', 'output_text')
                     )
                 current_messages.append({'role': role, 'content': content})
 
